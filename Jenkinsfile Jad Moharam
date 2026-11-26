@@ -3,6 +3,9 @@ pipeline {
 
     environment {
         VIRTUAL_ENV = 'venv'
+        // Local "deployment server": a folder inside the Jenkins home that
+        // outlives the workspace (the workspace is wiped by cleanWs()).
+        DEPLOY_DIR = '/var/jenkins_home/deployments/python-app'
     }
 
     stages {
@@ -21,7 +24,7 @@ pipeline {
         stage('Lint') {
             steps {
                 script {
-                    sh ". ${VIRTUAL_ENV}/bin/activate && flake8 app.py"
+                    sh ". ${VIRTUAL_ENV}/bin/activate && flake8 app.py deploy.py tests"
                 }
             }
         }
@@ -29,22 +32,81 @@ pipeline {
         stage('Test') {
             steps {
                 script {
-                    sh ". ${VIRTUAL_ENV}/bin/activate && pytest"
+                    sh ". ${VIRTUAL_ENV}/bin/activate && pytest -v --junitxml=test-results.xml"
+                }
+            }
+            post {
+                always {
+                    junit 'test-results.xml'
                 }
             }
         }
 
+        // NEW (Part 4, Step 1): code coverage with coverage.py
+        stage('Coverage') {
+            steps {
+                script {
+                    sh """
+                        . ${VIRTUAL_ENV}/bin/activate
+                        coverage run -m pytest -q
+                        coverage report --fail-under=80
+                        coverage xml -o coverage.xml
+                        coverage html -d htmlcov
+                    """
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'coverage.xml, htmlcov/**', allowEmptyArchive: true
+                }
+            }
+        }
+
+        // NEW (Part 4, Step 2): security scanning with bandit
+        stage('Security Scan') {
+            steps {
+                script {
+                    sh """
+                        . ${VIRTUAL_ENV}/bin/activate
+                        # Full report (all severities) kept as a build artifact
+                        bandit -r . -x ./${VIRTUAL_ENV},./tests -f json -o bandit-report.json --exit-zero
+                        # Gate: fail the build on any medium or high severity issue
+                        bandit -r . -x ./${VIRTUAL_ENV},./tests -ll
+                    """
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'bandit-report.json', allowEmptyArchive: true
+                }
+            }
+        }
+
+        // UPDATED (Part 4, Step 3): real local deployment instead of an echo
         stage('Deploy') {
             steps {
                 script {
-                    // Deployment logic, e.g., pushing to a remote server
-                    echo "Deploying application..."
+                    echo "Deploying application to ${DEPLOY_DIR}..."
+                    sh """
+                        . ${VIRTUAL_ENV}/bin/activate
+                        python deploy.py ${DEPLOY_DIR}
+                        echo "--- Deployed release info ---"
+                        cat ${DEPLOY_DIR}/current/release.json
+                        echo "--- Running deployed app ---"
+                        python ${DEPLOY_DIR}/current/app.py
+                    """
                 }
             }
         }
     }
 
     post {
+        success {
+            echo 'Pipeline succeeded: lint, tests, coverage, security scan and deployment all passed.'
+        }
+        failure {
+            echo 'Pipeline failed. Check the stage logs above.'
+        }
         always {
             cleanWs()
         }
